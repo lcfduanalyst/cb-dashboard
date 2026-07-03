@@ -1,0 +1,27 @@
+# 大数据文件
+*.xlsx
+*.csv
+export/
+
+# 输出目录（只保留看板）
+output/central_quantiles/
+output/logs/
+output/dashboard/.echarts_cache.js
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude
+.claude/
+
+# 系统
+.DS_Store
+Thumbs.db
