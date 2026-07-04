@@ -32,9 +32,9 @@ from typing import Optional
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  PyCharm 快捷运行：直接点绿色箭头即可，改下面的值控制行为     ║
 # ╚══════════════════════════════════════════════════════════════╝
-PYCHARM_START_DATE = ""       # 开始日期，空=今天（如 "2026-07-03"）
+PYCHARM_START_DATE = "2026-07-03"       # 开始日期，空=今天（如 "2026-07-03"）
 PYCHARM_END_DATE = ""         # 结束日期，空=同开始日期
-PYCHARM_WRITE_MODE = False    # True=正式写入MySQL  False=演练不写库
+PYCHARM_WRITE_MODE = True    # True=正式写入MySQL  False=演练不写库
 PYCHARM_SKIP_SYNC = False     # True=跳过 Wind 同步
 PYCHARM_SKIP_PREMIUM = False  # True=跳过溢价率回归
 PYCHARM_SKIP_QUANTILES = False  # True=跳过分位数 Excel
