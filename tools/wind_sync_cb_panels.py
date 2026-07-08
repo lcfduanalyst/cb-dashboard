@@ -14,6 +14,10 @@
 写库（--write）完成后，默认自动执行 sql/更新_衍生指标.sql（转股价值、日度中位数、条件价格等）；
 可用 --skip-derived 跳过。
 
+截面基础信息 cb_bond_info：写库后默认刷新（--skip-bond-info 跳过）。
+  新券全字段 INSERT；已存在券仅强制更新 last_trade_date（Wind 无效值写 NULL）。
+首次灌库：python tools/wind_sync_cb_panels.py --import-bond-info --write（读 转债基础信息.xlsx）。
+
 
 终端运行（不写库）：python tools/wind_sync_cb_panels.py --start-date 2026-01-01 --end-date 2026-01-10 --wind-set-template "date={wind_date};sectorid=你的板块ID" --dry-run
 终端运行（写库）：python tools/wind_sync_cb_panels.py --start-date 2026-01-01 --end-date 2026-01-10 --wind-set-template "date={wind_date};sectorid=你的板块ID" --db cb_data --user root --password "你的密码" --write
@@ -40,13 +44,24 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import pymysql
 
-from wind_api_helpers import DEFAULT_WSD_BATCH_SIZE, wind_fetch_wsd_text_by_date
+from wind_api_helpers import (
+    DEFAULT_WSD_BATCH_SIZE,
+    normalize_bond_code_for_wind,
+    wind_fetch_wsd_text_by_date,
+)
 from wind_panel_registry import (
+    BOND_INFO_DATE_COLUMNS,
+    BOND_INFO_EXCEL_COLUMNS,
+    BOND_INFO_TEXT_COLUMNS,
+    BOND_INFO_WSS_FIELDS,
+    BOND_INFO_WSS_OPTION_SUFFIX,
     all_panel_tables,
+    bond_info_wss_field_list,
     panel_value_type,
     panel_wind_api,
     panel_wss_extra_options,
     filter_excluded_bond_codes,
+    is_excluded_bond_code,
 )
 
 # ----------------------------
@@ -57,6 +72,18 @@ DEFAULT_END_DATE = "2026-07-2"
 DEFAULT_WIND_SET_TEMPLATE = "date={wind_date};sectorid=1000073208000000"
 DEFAULT_DRY_RUN = True  # 默认只演练不写库；需要写库请传 --write
 DEFAULT_DERIVED_SQL = _REPO_ROOT / "sql" / "更新_衍生指标.sql"
+DEFAULT_BOND_INFO_SCHEMA = _REPO_ROOT / "sql" / "schema_cb_bond_info_mysql8.sql"
+DEFAULT_BOND_INFO_XLSX = _REPO_ROOT / "转债基础信息.xlsx"
+
+BOND_INFO_DB_COLUMNS = (
+    "bond_code",
+    "bond_name",
+    "list_date",
+    "last_trade_date",
+    "stock_code",
+    "stock_name",
+    "sw_industry_l1",
+)
 
 # 表 ↔ Wind 字段见 wind_panel_registry.py（新增表只需改注册表 + 建表 SQL）
 
@@ -403,6 +430,370 @@ def run_sql_file(conn: pymysql.connections.Connection, path: Path) -> int:
     return len(statements)
 
 
+def _parse_optional_date(x: object) -> Optional[date]:
+  if _is_missing(x):
+    return None
+  if isinstance(x, datetime):
+    d = x.date()
+    if d.year < 1990:
+      return None
+    return d
+  if isinstance(x, date):
+    if x.year < 1990:
+      return None
+    return x
+  s = str(x).strip()
+  if not s or s in ("0", "0.0", "nan", "None", "none", "NaT", "0:00:00"):
+    return None
+  for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+    try:
+      d = datetime.strptime(s[:10], fmt).date()
+      if d.year < 1990:
+        return None
+      return d
+    except ValueError:
+      continue
+  return None
+
+
+def _normalize_code_cell(x: object) -> Optional[str]:
+  code = normalize_bond_code_for_wind(x)
+  if code:
+    return code
+  if x is None:
+    return None
+  s = str(x).strip().upper()
+  if _CODE_RE.match(s):
+    return s
+  if len(s) == 6 and s.isdigit():
+    if s.startswith(("0", "3")):
+      return f"{s}.SZ"
+    if s.startswith("6"):
+      return f"{s}.SH"
+  return None
+
+
+def ensure_bond_info_table(conn: pymysql.connections.Connection) -> None:
+  run_sql_file(conn, DEFAULT_BOND_INFO_SCHEMA)
+
+
+def query_existing_bond_codes(
+    conn: pymysql.connections.Connection,
+    codes: Sequence[str],
+) -> set[str]:
+    """查询 codes 中已在 cb_bond_info 的 bond_code。"""
+    if not codes:
+        return set()
+    existing: set[str] = set()
+    for chunk in _iter_chunks(list(codes), 500):
+        placeholders = ",".join(["%s"] * len(chunk))
+        sql = f"SELECT bond_code FROM cb_bond_info WHERE bond_code IN ({placeholders})"
+        with conn.cursor() as cur:
+            cur.execute(sql, chunk)
+            existing.update(str(row[0]).strip().upper() for row in cur.fetchall())
+    return existing
+
+
+def update_bond_info_last_trade_dates(
+    conn: pymysql.connections.Connection,
+    rows: Sequence[Tuple[str, Optional[date]]],
+) -> int:
+    """已存在券：强制写入 last_trade_date（含 NULL，策略 B）。"""
+    if not rows:
+        return 0
+    sql = "UPDATE cb_bond_info SET last_trade_date = %s WHERE bond_code = %s"
+    params = [
+        (r[1].strftime("%Y-%m-%d") if r[1] else None, r[0])
+        for r in rows
+    ]
+    with conn.cursor() as cur:
+        cur.executemany(sql, params)
+        return len(params)
+
+
+def upsert_bond_info_rows(
+    conn: pymysql.connections.Connection,
+    rows: Sequence[Tuple[str, Optional[str], Optional[date], Optional[date], Optional[str], Optional[str], Optional[str]]],
+    *,
+    preserve_on_null: bool = False,
+) -> int:
+    if not rows:
+        return 0
+    cols = ", ".join(BOND_INFO_DB_COLUMNS)
+    placeholders = ", ".join(["%s"] * len(BOND_INFO_DB_COLUMNS))
+    if preserve_on_null:
+        updates = ", ".join(
+            f"{c} = COALESCE(VALUES({c}), {c})" for c in BOND_INFO_DB_COLUMNS if c != "bond_code"
+        )
+    else:
+        updates = ", ".join(f"{c} = VALUES({c})" for c in BOND_INFO_DB_COLUMNS if c != "bond_code")
+    sql = f"""
+    INSERT INTO cb_bond_info ({cols})
+    VALUES ({placeholders})
+    ON DUPLICATE KEY UPDATE {updates}
+    """
+    params = [
+        (
+            r[0],
+            r[1],
+            r[2].strftime("%Y-%m-%d") if r[2] else None,
+            r[3].strftime("%Y-%m-%d") if r[3] else None,
+            r[4],
+            r[5],
+            r[6],
+        )
+        for r in rows
+    ]
+    with conn.cursor() as cur:
+        cur.executemany(sql, params)
+        return len(params)
+
+
+def import_bond_info_from_xlsx(
+  conn: pymysql.connections.Connection,
+  xlsx_path: Path,
+) -> int:
+  try:
+    import pandas as pd
+  except ImportError as e:
+    raise RuntimeError("导入 Excel 需要 pandas、openpyxl：pip install pandas openpyxl") from e
+
+  if not xlsx_path.is_file():
+    raise FileNotFoundError(f"Excel 不存在：{xlsx_path}")
+
+  df = pd.read_excel(xlsx_path)
+  missing = [cn for cn in BOND_INFO_EXCEL_COLUMNS if cn not in df.columns]
+  if missing:
+    raise ValueError(f"Excel 缺少列：{missing}；当前列：{list(df.columns)}")
+
+  df = df.rename(columns=BOND_INFO_EXCEL_COLUMNS)
+  rows: List[Tuple[str, Optional[str], Optional[date], Optional[date], Optional[str], Optional[str], Optional[str]]] = []
+  for rec in df.to_dict(orient="records"):
+    bond_code = _normalize_code_cell(rec.get("bond_code"))
+    if not bond_code or is_excluded_bond_code(bond_code):
+      continue
+    bond_name = rec.get("bond_name")
+    bond_name_s = str(bond_name).strip() if not _is_missing(bond_name) else None
+    stock_code = _normalize_code_cell(rec.get("stock_code"))
+    stock_name = rec.get("stock_name")
+    stock_name_s = str(stock_name).strip() if not _is_missing(stock_name) else None
+    sw = rec.get("sw_industry_l1")
+    sw_s = str(sw).strip() if not _is_missing(sw) else None
+    rows.append(
+      (
+        bond_code,
+        bond_name_s or None,
+        _parse_optional_date(rec.get("list_date")),
+        _parse_optional_date(rec.get("last_trade_date")),
+        stock_code,
+        stock_name_s or None,
+        sw_s or None,
+      )
+    )
+
+  ensure_bond_info_table(conn)
+  n = upsert_bond_info_rows(conn, rows, preserve_on_null=False)
+  conn.commit()
+  return n
+
+
+def wind_wss_static(
+  w,
+  codes: Sequence[str],
+  wind_fields: str,
+  trade_date: date,
+  batch_size: int,
+  pause_ms: int,
+  text_field_names: Sequence[str],
+  date_field_names: Sequence[str],
+  wss_option_suffix: str = "",
+  date_fields_record_null: Optional[Sequence[str]] = None,
+) -> Dict[str, Dict[str, Union[str, date, None]]]:
+  """截面基础信息 w.wss（tradeDate + 可选 industryType 等）。"""
+  text_fields = {f.strip().lower() for f in text_field_names if f.strip()}
+  date_fields = {f.strip().lower() for f in date_field_names if f.strip()}
+  null_date_fields = {f.strip().lower() for f in (date_fields_record_null or []) if f.strip()}
+  merged: Dict[str, Dict[str, Union[str, date, None]]] = {}
+  td_opt = _to_wind_trade_date(trade_date)
+  opt = f"tradeDate={td_opt}"
+  extra = wss_option_suffix.strip()
+  if extra:
+    opt = f"{opt};{extra}"
+
+  for chunk in _iter_chunks(list(codes), batch_size):
+    codes_arg = ",".join(chunk)
+    r = w.wss(codes_arg, wind_fields, opt)
+    if getattr(r, "ErrorCode", -1) != 0:
+      raise RuntimeError(
+        f"Wind wss(static) 失败：fields={wind_fields} ErrorCode={r.ErrorCode} Data={r.Data}"
+      )
+
+    r_codes = list(getattr(r, "Codes", []) or [])
+    r_data = getattr(r, "Data", None)
+    if not r_codes or not r_data or not isinstance(r_data, list):
+      time.sleep(pause_ms / 1000.0)
+      continue
+
+    fields_attr = getattr(r, "Fields", None)
+    if fields_attr:
+      flds = [str(f).lower() for f in list(fields_attr)]
+    else:
+      flds = [f.strip().lower() for f in wind_fields.split(",") if f.strip()]
+
+    for fi, fname in enumerate(flds):
+      if fi >= len(r_data):
+        break
+      col = r_data[fi]
+      if not isinstance(col, (list, tuple)):
+        col = [col]
+      for ci, code in enumerate(r_codes):
+        if ci >= len(col):
+          break
+        v = col[ci]
+        sc = _normalize_wind_code(code)
+        if not sc:
+          continue
+        if fname in date_fields:
+          if _is_missing(v):
+            if fname in null_date_fields:
+              merged.setdefault(sc, {})[fname] = None
+            continue
+          dv = _parse_optional_date(v)
+          if fname in null_date_fields:
+            merged.setdefault(sc, {})[fname] = dv
+            continue
+          if dv is None:
+            continue
+          merged.setdefault(sc, {})[fname] = dv
+          continue
+        if _is_missing(v):
+          continue
+        if fname in text_fields:
+          sv = str(v).strip()
+          if not sv or sv.lower() in ("nan", "none"):
+            continue
+          if fname in ("underlyingcode",):
+            sv_norm = _normalize_code_cell(sv)
+            merged.setdefault(sc, {})[fname] = sv_norm or sv
+          else:
+            merged.setdefault(sc, {})[fname] = sv
+          continue
+        try:
+          fv = float(v)
+        except Exception:
+          sv = str(v).strip()
+          if sv:
+            merged.setdefault(sc, {})[fname] = sv
+          continue
+        if fv == 0.0:
+          continue
+        merged.setdefault(sc, {})[fname] = fv
+
+    if null_date_fields:
+      for code in chunk:
+        sc = _normalize_wind_code(code)
+        if not sc:
+          continue
+        for fn in null_date_fields:
+          merged.setdefault(sc, {}).setdefault(fn, None)
+
+    time.sleep(pause_ms / 1000.0)
+
+  return merged
+
+
+def sync_bond_info_from_wind(
+  w,
+  conn: pymysql.connections.Connection,
+  codes: Sequence[str],
+  trade_date: date,
+  batch_size: int,
+  pause_ms: int,
+) -> int:
+  """
+  截面基础信息同步：
+  - 新券（表内不存在）：w.wss 全字段 INSERT
+  - 老券（表内已存在）：仅更新 last_trade_date（策略 B：无效值写 NULL）
+  """
+  codes_clean = filter_excluded_bond_codes(list(codes))
+  if not codes_clean:
+    return 0
+
+  ensure_bond_info_table(conn)
+  existing = query_existing_bond_codes(conn, codes_clean)
+  new_codes = [c for c in codes_clean if c not in existing]
+  old_codes = [c for c in codes_clean if c in existing]
+
+  field_lower_to_col = {wf.lower(): col for col, wf in BOND_INFO_WSS_FIELDS.items()}
+  text_wind_names = [BOND_INFO_WSS_FIELDS[c] for c in BOND_INFO_TEXT_COLUMNS if c in BOND_INFO_WSS_FIELDS]
+  date_wind_names = [BOND_INFO_WSS_FIELDS[c] for c in BOND_INFO_DATE_COLUMNS if c in BOND_INFO_WSS_FIELDS]
+  ltd_wind_field = BOND_INFO_WSS_FIELDS["last_trade_date"]
+  ltd_wind_key = ltd_wind_field.lower()
+
+  total = 0
+
+  if new_codes:
+    wind_fields = bond_info_wss_field_list()
+    per_code = wind_wss_static(
+      w=w,
+      codes=new_codes,
+      wind_fields=wind_fields,
+      trade_date=trade_date,
+      batch_size=batch_size,
+      pause_ms=pause_ms,
+      text_field_names=text_wind_names,
+      date_field_names=date_wind_names,
+      wss_option_suffix=BOND_INFO_WSS_OPTION_SUFFIX,
+    )
+    new_rows: List[Tuple[str, Optional[str], Optional[date], Optional[date], Optional[str], Optional[str], Optional[str]]] = []
+    for bond_code in new_codes:
+      fvmap = per_code.get(bond_code, {})
+      row_map: Dict[str, Optional[Union[str, date]]] = {c: None for c in BOND_INFO_DB_COLUMNS}
+      row_map["bond_code"] = bond_code
+      for fl, val in fvmap.items():
+        col = field_lower_to_col.get(fl)
+        if not col:
+          continue
+        row_map[col] = val  # type: ignore[assignment]
+      new_rows.append(
+        (
+          bond_code,
+          row_map.get("bond_name"),  # type: ignore[arg-type]
+          row_map.get("list_date"),  # type: ignore[arg-type]
+          row_map.get("last_trade_date"),  # type: ignore[arg-type]
+          row_map.get("stock_code"),  # type: ignore[arg-type]
+          row_map.get("stock_name"),  # type: ignore[arg-type]
+          row_map.get("sw_industry_l1"),  # type: ignore[arg-type]
+        )
+      )
+    total += upsert_bond_info_rows(conn, new_rows, preserve_on_null=False)
+    print(f"  cb_bond_info: inserted {len(new_rows)} new bond(s)")
+
+  if old_codes:
+    per_ltd = wind_wss_static(
+      w=w,
+      codes=old_codes,
+      wind_fields=ltd_wind_field,
+      trade_date=trade_date,
+      batch_size=batch_size,
+      pause_ms=pause_ms,
+      text_field_names=[],
+      date_field_names=[ltd_wind_field],
+      wss_option_suffix=BOND_INFO_WSS_OPTION_SUFFIX,
+      date_fields_record_null=[ltd_wind_field],
+    )
+    ltd_rows: List[Tuple[str, Optional[date]]] = []
+    for bond_code in old_codes:
+      raw = per_ltd.get(bond_code, {}).get(ltd_wind_key)
+      ltd: Optional[date] = raw if isinstance(raw, date) else None
+      ltd_rows.append((bond_code, ltd))
+    total += update_bond_info_last_trade_dates(conn, ltd_rows)
+    print(f"  cb_bond_info: updated last_trade_date for {len(ltd_rows)} existing bond(s)")
+
+  conn.commit()
+  return total
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="按 Wind 交易日 + 板块成分，同步可转债面板数据到 MySQL（UPSERT）。"
@@ -473,7 +864,44 @@ def main() -> None:
         default=str(DEFAULT_DERIVED_SQL),
         help=f"衍生指标 SQL 文件路径，默认 {DEFAULT_DERIVED_SQL.name}",
     )
+    parser.add_argument(
+        "--skip-bond-info",
+        action="store_true",
+        help="写库后跳过 cb_bond_info 截面基础信息刷新",
+    )
+    parser.add_argument(
+        "--import-bond-info",
+        action="store_true",
+        help="从 转债基础信息.xlsx 导入 cb_bond_info 后退出（需 --write，不跑 Wind 同步）",
+    )
+    parser.add_argument(
+        "--bond-info-xlsx",
+        default=str(DEFAULT_BOND_INFO_XLSX),
+        help="转债基础信息 Excel 路径",
+    )
     args = parser.parse_args()
+
+    cfg = MysqlCfg(
+        host=args.host,
+        port=args.port,
+        user=args.user,
+        password=args.password,
+        database=args.database,
+    )
+
+    if args.import_bond_info:
+        if args.dry_run:
+            raise SystemExit("--import-bond-info 需配合 --write")
+        print(f"MySQL: {cfg.user}@{cfg.host}:{cfg.port}/{cfg.database}")
+        xlsx_path = Path(args.bond_info_xlsx)
+        print(f"Importing bond info from: {xlsx_path}")
+        conn = mysql_connect(cfg)
+        try:
+            n = import_bond_info_from_xlsx(conn, xlsx_path)
+            print(f"Imported {n} rows into cb_bond_info.")
+        finally:
+            conn.close()
+        return
 
     start_d = _parse_date(args.start_date)
     end_d = _parse_date(args.end_date)
@@ -504,14 +932,6 @@ def main() -> None:
             raise SystemExit(f"Wind 字段冲突：{fn} 对应多张表")
         field_lower_to_table[fn] = t
 
-    cfg = MysqlCfg(
-        host=args.host,
-        port=args.port,
-        user=args.user,
-        password=args.password,
-        database=args.database,
-    )
-
     print(f"MySQL: {cfg.user}@{cfg.host}:{cfg.port}/{cfg.database}")
     print(f"Tables: {tables}")
     print(f"Wind wss fields (bulk): {wind_fields or '(none)'}")
@@ -531,6 +951,7 @@ def main() -> None:
     try:
         conn = conn_ctx
         total_rows = 0
+        all_sync_codes: set[str] = set()
         for td in trade_days:
             wd = _to_wind_trade_date(td)
             set_opt = args.wind_set_template.format(wind_date=wd)
@@ -570,6 +991,7 @@ def main() -> None:
                 print(f"[{td}] all codes excluded by bond blacklist, skip")
                 continue
 
+            all_sync_codes.update(codes)
             print(f"[{td}] universe size(after filter)={len(codes)}")
             per_code: Dict[str, Dict[str, Union[float, str]]] = {}
             if wind_fields:
@@ -672,6 +1094,24 @@ def main() -> None:
 
         if not args.dry_run:
             print(f"\nDone. Total row writes (sum across tables): {total_rows}")
+            if not args.skip_bond_info and all_sync_codes:
+                info_trade_date = trade_days[-1] if trade_days else end_d
+                print(f"\nRefreshing cb_bond_info for {len(all_sync_codes)} bonds (tradeDate={info_trade_date})...")
+                try:
+                    assert conn is not None
+                    n_info = sync_bond_info_from_wind(
+                        w=w,
+                        conn=conn,
+                        codes=sorted(all_sync_codes),
+                        trade_date=info_trade_date,
+                        batch_size=args.batch_size,
+                        pause_ms=args.pause_ms,
+                    )
+                    print(f"cb_bond_info updated ({n_info} rows).")
+                except Exception as e:
+                    conn.rollback()
+                    print(f"cb_bond_info refresh failed: {e}", file=sys.stderr)
+                    raise SystemExit(1) from e
             if not args.skip_derived:
                 derived_path = Path(args.derived_sql)
                 print(f"\nRefreshing derived indicators: {derived_path}")

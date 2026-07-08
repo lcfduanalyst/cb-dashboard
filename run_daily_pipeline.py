@@ -3,11 +3,13 @@
 """
 可转债基础数据库 —— 每日管线总控脚本。
 
-流程（4 步）：
+流程（6 步）：
   1. wind_sync_cb_panels        Wind → MySQL 面板数据（含条件价格指数等衍生指标）
   2. run_premium_by_conv_value  截面回归 → 各平价转股溢价率估值表
-  3. run_central_quantiles      中枢分位数 → Excel / 图
-  4. generate_dashboard         HTML 数据看板
+  3. calc_industry_index        行业指数 → 各行业转债加权指数走势
+  4. run_central_quantiles      中枢分位数 → Excel / 图
+  5. generate_dashboard         HTML 数据看板
+  6. git_push                   自动提交看板并推送到 GitHub Pages
 
 用法：
   python run_daily_pipeline.py --write                     # 正式写入当天
@@ -32,13 +34,15 @@ from typing import Optional
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  PyCharm 快捷运行：直接点绿色箭头即可，改下面的值控制行为     ║
 # ╚══════════════════════════════════════════════════════════════╝
-PYCHARM_START_DATE = "2026-07-03"       # 开始日期，空=今天（如 "2026-07-03"）
+PYCHARM_START_DATE = "2026-07-07"       # 开始日期，空=今天（如 "2026-07-03"）
 PYCHARM_END_DATE = ""         # 结束日期，空=同开始日期
 PYCHARM_WRITE_MODE = True    # True=正式写入MySQL  False=演练不写库
 PYCHARM_SKIP_SYNC = False     # True=跳过 Wind 同步
 PYCHARM_SKIP_PREMIUM = False  # True=跳过溢价率回归
 PYCHARM_SKIP_QUANTILES = False  # True=跳过分位数 Excel
 PYCHARM_SKIP_DASHBOARD = False  # True=跳过 HTML 看板
+PYCHARM_SKIP_PUSH = False       # True=跳过 Git 推送
+PYCHARM_SKIP_INDUSTRY = False   # True=跳过行业指数
 # ══════════════════════════════════════════════════════════════
 
 # ── 项目路径 ─────────────────────────────────────────────
@@ -48,7 +52,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 LOG_DIR = OUTPUT_DIR / "logs"
 
 DEFAULT_WIND_SET_TEMPLATE = "date={wind_date};sectorid=1000073208000000"
-TOTAL_STEPS = 4
+TOTAL_STEPS = 6
 
 
 # ── Python 解释器 ─────────────────────────────────────────
@@ -165,7 +169,25 @@ def step_premium_valuation(args: argparse.Namespace) -> bool:
     return _run_subprocess(cmd, f"Step 2/{TOTAL_STEPS}: 溢价率回归")
 
 
-# ── Step 3: 中枢分位数 Excel ──────────────────────────────
+# ── Step 3: 行业指数 ────────────────────────────────────
+def step_industry_index(args: argparse.Namespace) -> bool:
+    """计算各行业转债加权指数，写入 cb_strategy.cb_industry_index。"""
+    python = _find_python()
+    cmd = [
+        python,
+        str(TOOLS_DIR / "calc_industry_index.py"),
+        "--host", args.host, "--port", str(args.port),
+        "--user", args.user, "--password", args.password,
+        "--lookback", "30",  # 每日只重算最近 30 天
+    ]
+    if args.dry_run:
+        logging.info(f"[Step 3/{TOTAL_STEPS}: 行业指数] 演练模式，跳过实际执行")
+        return True
+    cmd.append("--write")
+    return _run_subprocess(cmd, f"Step 3/{TOTAL_STEPS}: 行业指数")
+
+
+# ── Step 4: 中枢分位数 Excel ──────────────────────────────
 def step_quantiles(args: argparse.Namespace) -> bool:
     python = _find_python()
     cmd = [
@@ -181,10 +203,10 @@ def step_quantiles(args: argparse.Namespace) -> bool:
         cmd.append("--plot")
     if args.also_fixed_name:
         cmd.append("--also-fixed-name")
-    return _run_subprocess(cmd, f"Step 3/{TOTAL_STEPS}: 分位数Excel")
+    return _run_subprocess(cmd, f"Step 4/{TOTAL_STEPS}: 分位数Excel")
 
 
-# ── Step 4: HTML 看板 ─────────────────────────────────────
+# ── Step 5: HTML 看板 ─────────────────────────────────────
 def step_dashboard(args: argparse.Namespace) -> bool:
     python = _find_python()
     cmd = [
@@ -195,13 +217,64 @@ def step_dashboard(args: argparse.Namespace) -> bool:
         "--db", args.database,
         "--output", str(args.output_dir / "dashboard" / "cb_dashboard.html"),
     ]
-    return _run_subprocess(cmd, f"Step 4/{TOTAL_STEPS}: HTML看板")
+    return _run_subprocess(cmd, f"Step 5/{TOTAL_STEPS}: HTML看板")
+
+
+# ── Step 6: Git 推送（自动更新 GitHub Pages）──────────────
+def step_git_push(args: argparse.Namespace) -> bool:
+    """将看板 HTML 提交并推送到 GitHub，自动更新 GitHub Pages 链接。"""
+    label = f"Step 6/{TOTAL_STEPS}: Git推送"
+    if args.dry_run:
+        logging.info(f"[{label}] 演练模式，跳过")
+        return True
+
+    import subprocess as sp
+
+    def _git(cmd: list[str]) -> tuple[int, str, str]:
+        """运行 git 命令，返回 (returncode, stdout, stderr)。"""
+        r = sp.run(
+            ["git"] + cmd,
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True,
+        )
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+    # 1) 暂存看板文件
+    dashboard_path = str(args.output_dir / "dashboard" / "cb_dashboard.html")
+    rc, out, err = _git(["add", dashboard_path])
+    if rc != 0:
+        logging.error(f"[{label}] git add 失败: {err}")
+        return False
+
+    # 检查是否有改动
+    rc, out, err = _git(["diff", "--cached", "--quiet"])
+    if rc == 0:
+        logging.info(f"[{label}] 看板无变化，跳过推送")
+        return True  # 没有改动不算失败
+
+    # 2) 提交
+    today = date.today().strftime("%Y-%m-%d")
+    commit_msg = f"auto: dashboard update {today}"
+    rc, out, err = _git(["commit", "-m", commit_msg])
+    if rc != 0:
+        logging.error(f"[{label}] git commit 失败: {err}")
+        return False
+    logging.info(f"[{label}] 提交: {commit_msg}")
+
+    # 3) 推送
+    rc, out, err = _git(["push"])
+    if rc != 0:
+        logging.error(f"[{label}] git push 失败（网络问题？）: {err}")
+        logging.warning(f"[{label}] 可稍后手动执行: git push")
+        return False
+    logging.info(f"[{label}] 已推送到 GitHub → https://lcfduanalyst.github.io/cb-dashboard/")
+    return True
 
 
 # ── 参数解析 ──────────────────────────────────────────────
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     today_str = date.today().strftime("%Y-%m-%d")
-    parser = argparse.ArgumentParser(description="可转债每日管线一键运行（4 步）")
+    parser = argparse.ArgumentParser(description="可转债每日管线一键运行（6 步）")
 
     # 日期 — 所有依赖日期的步骤统一使用
     parser.add_argument("--date", default=None,
@@ -240,8 +313,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     # 跳过步骤
     parser.add_argument("--skip-sync", action="store_true", help="跳过 Wind 同步")
     parser.add_argument("--skip-premium", action="store_true", help="跳过溢价率回归")
+    parser.add_argument("--skip-industry", action="store_true", help="跳过行业指数")
     parser.add_argument("--skip-quantiles", action="store_true", help="跳过分位数 Excel")
     parser.add_argument("--skip-dashboard", action="store_true", help="跳过 HTML 看板")
+    parser.add_argument("--skip-push", action="store_true", help="跳过 Git 推送")
 
     args = parser.parse_args(argv)
 
@@ -256,10 +331,14 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
             args.skip_sync = True
         if PYCHARM_SKIP_PREMIUM:
             args.skip_premium = True
+        if PYCHARM_SKIP_INDUSTRY:
+            args.skip_industry = True
         if PYCHARM_SKIP_QUANTILES:
             args.skip_quantiles = True
         if PYCHARM_SKIP_DASHBOARD:
             args.skip_dashboard = True
+        if PYCHARM_SKIP_PUSH:
+            args.skip_push = True
 
     ref = args.date or today_str
     if args.start_date is None:
@@ -282,8 +361,10 @@ def main(argv: Optional[list] = None) -> int:
     steps = []
     if not args.skip_sync: steps.append("sync")
     if not args.skip_premium: steps.append("premium")
+    if not args.skip_industry: steps.append("industry")
     if not args.skip_quantiles: steps.append("quantiles")
     if not args.skip_dashboard: steps.append("dashboard")
+    if not args.skip_push: steps.append("push")
 
     logging.info("=" * 55)
     logging.info(
@@ -321,16 +402,28 @@ def main(argv: Optional[list] = None) -> int:
         logging.info(f"[Step 2/{TOTAL_STEPS}: 溢价率回归] 已跳过")
 
     # Step 3
+    if not args.skip_industry:
+        results["industry"] = step_industry_index(args)
+    else:
+        logging.info(f"[Step 3/{TOTAL_STEPS}: 行业指数] 已跳过")
+
+    # Step 4
     if not args.skip_quantiles:
         results["quantiles"] = step_quantiles(args)
     else:
-        logging.info(f"[Step 3/{TOTAL_STEPS}: 分位数Excel] 已跳过")
+        logging.info(f"[Step 4/{TOTAL_STEPS}: 分位数Excel] 已跳过")
 
-    # Step 4
+    # Step 5
     if not args.skip_dashboard:
         results["dashboard"] = step_dashboard(args)
     else:
-        logging.info(f"[Step 4/{TOTAL_STEPS}: HTML看板] 已跳过")
+        logging.info(f"[Step 5/{TOTAL_STEPS}: HTML看板] 已跳过")
+
+    # Step 6
+    if not args.skip_push:
+        results["push"] = step_git_push(args)
+    else:
+        logging.info(f"[Step 6/{TOTAL_STEPS}: Git推送] 已跳过")
 
     # 汇总
     logging.info("=" * 55)

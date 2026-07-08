@@ -96,6 +96,58 @@ HIST_PCT_WINDOWS: Tuple[Tuple[str, str], ...] = (
 )
 
 
+# ── 行业指数数据 ──────────────────────────────────────────
+def load_industry_data(conn) -> dict:
+    """从 cb_strategy.cb_industry_index 加载行业指数数据。"""
+    sql = """
+    SELECT trade_date, industry_name, index_value, daily_return, market_cap, bond_count
+    FROM cb_strategy.cb_industry_index
+    ORDER BY industry_name, trade_date
+    """
+    df = pd.read_sql(sql, conn)
+    if df.empty:
+        return {"industries": [], "series_by_industry": {}, "latest": []}
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df["index_value"] = pd.to_numeric(df["index_value"], errors="coerce")
+    df["daily_return"] = pd.to_numeric(df["daily_return"], errors="coerce")
+
+    # 按行业分组 → 时序
+    series_by_industry: dict = {}
+    for ind, grp in df.groupby("industry_name", sort=True):
+        grp_sorted = grp.sort_values("trade_date")
+        series_by_industry[ind] = [
+            {
+                "date": r["trade_date"].strftime("%Y-%m-%d"),
+                "value": round(float(r["index_value"]), 2),
+                "ret": round(float(r["daily_return"]) * 100, 4),  # 转为 %
+            }
+            for _, r in grp_sorted.iterrows()
+            if not pd.isna(r["index_value"])
+        ]
+
+    # 最新一日快照
+    latest_date = df["trade_date"].max()
+    latest_df = df[df["trade_date"] == latest_date].sort_values("index_value", ascending=False)
+    latest_list = []
+    for _, r in latest_df.iterrows():
+        latest_list.append({
+            "industry": str(r["industry_name"]),
+            "value": round(float(r["index_value"]), 2),
+            "ret": round(float(r["daily_return"]) * 100, 4),
+            "bonds": int(r["bond_count"]) if not pd.isna(r["bond_count"]) else 0,
+        })
+
+    industries_order = [r["industry"] for r in latest_list]
+
+    return {
+        "industries": industries_order,
+        "series_by_industry": series_by_industry,
+        "latest": latest_list,
+        "latest_date": latest_date.strftime("%Y-%m-%d"),
+    }
+
+
 # ── 数据库 ────────────────────────────────────────────────
 def mysql_connect(
     host: str, port: int, user: str, password: str, database: str
@@ -332,12 +384,12 @@ body {
   .header .meta { font-size: 11px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
   .header .meta span { margin-left: 0; }
   .container { padding: 10px 12px; }
-  .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
-  .kpi-card { padding: 12px 14px; border-left-width: 3px; }
-  .kpi-card .kpi-label { font-size: 11px; }
-  .kpi-card .kpi-value { font-size: 22px; }
-  .kpi-card .kpi-sub { font-size: 10px; gap: 8px; flex-wrap: wrap; }
-  .kpi-card .kpi-change { font-size: 11px; }
+  .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+  .kpi-card { padding: 10px 12px; border-left-width: 3px; }
+  .kpi-card .kpi-label { font-size: 10px; }
+  .kpi-card .kpi-value { font-size: 18px; }
+  .kpi-card .kpi-sub { font-size: 9px; gap: 6px; flex-wrap: wrap; }
+  .kpi-card .kpi-change { font-size: 10px; }
   #main-chart { height: 280px; }
   #pct-chart { height: 160px; }
   .chart-panel { padding: 10px 12px; }
@@ -406,11 +458,54 @@ body {
 
 </div>
 
+<!-- ═══════════════════════════════════════════════════════ -->
+<!-- 模块二：行业指数 -->
+<!-- ═══════════════════════════════════════════════════════ -->
+<div style="max-width:1400px;margin:0 auto;padding:0 24px;">
+  <hr style="border:none;border-top:2px solid #cbd5e1;margin:8px 0 20px;">
+  <h2 style="font-size:18px;font-weight:700;color:#0f172a;margin-bottom:14px;">🏭 行业指数走势 <span style="font-size:12px;font-weight:400;color:#94a3b8;">（2020-12-31 = 100）</span></h2>
+</div>
+
+<div class="container">
+  <div class="kpi-grid" id="industry-kpi-grid"></div>
+
+  <div class="chart-panel">
+    <div class="chart-title">📈 各行业转债加权指数</div>
+    <div id="industry-chart" style="width:100%;height:450px;"></div>
+  </div>
+
+  <div class="bottom-grid" style="margin-top:16px;">
+    <div class="table-panel" style="max-height:520px;">
+      <h3>📋 行业排名（<span id="ind-latest-date"></span>）</h3>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr>
+            <th>行业</th><th>指数</th><th>当日涨跌</th><th>样本数</th>
+          </tr></thead>
+          <tbody id="industry-table-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="range-panel" id="industry-info-panel">
+      <h3>📌 说明</h3>
+      <div style="font-size:12px;color:#475569;line-height:1.8;">
+        <p>• 基日 <b>2020-12-31</b>，基点 <b>100</b></p>
+        <p>• 加权方式：前一日市值 × 当日涨跌幅</p>
+        <p>• 样本：规模 &gt; 0.3亿 的存续转债</p>
+        <p>• <b>_全市场</b>：所有行业汇总</p>
+        <p>• <b>_非银行</b>：剔除银行后的汇总</p>
+        <p style="margin-top:8px;">💡 点击图例可切换行业显示</p>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="footer">可转债基础数据库 · 点击 KPI 卡片切换指标 · 图表支持滚轮缩放与拖拽</div>
 
 <script>
 // ── 数据注入 ─────────────────────────────────────────────
 const METRICS_DATA = ___METRICS_JSON___;
+const INDUSTRY_DATA = ___INDUSTRY_JSON___;
 
 const METRICS = [
   { id: "cond_mean", name: "条件价格中枢", unit: "", decimals: 2, color: "#7c3aed" },
@@ -739,6 +834,182 @@ setTimeout(() => {
     sc.innerHTML = '<p style="color:#dc2626;font-size:12px;">JS 加载异常，请尝试刷新页面或检查网络（ECharts CDN）</p>';
   }
 }, 2000);
+
+// ═══════════════════════════════════════════════════════
+// 模块二：行业指数
+// ═══════════════════════════════════════════════════════
+const IND_CHART = echarts.init(document.getElementById("industry-chart"));
+const IND_COLORS = [
+  "#2563eb","#dc2626","#16a34a","#f59e0b","#7c3aed","#0891b2","#be123c",
+  "#4f46e5","#ea580c","#65a30d","#db2777","#0284c7","#9a3412","#5b21b6",
+  "#0d9488","#b91c1c","#6366f1","#ca8a04","#059669","#e11d48","#2563eb",
+  "#9333ea","#0e7490","#a3e635","#f97316","#14b8a6","#ec4899","#8b5cf6",
+];
+
+function _industryNdayReturn(indName, nDays) {
+  // 计算某行业近 N 个交易日的累计收益（%）
+  const pts = (INDUSTRY_DATA.series_by_industry || {})[indName];
+  if (!pts || pts.length < nDays + 1) return null;
+  const v0 = pts[pts.length - 1 - nDays].value;
+  const v1 = pts[pts.length - 1].value;
+  if (!v0 || v0 === 0) return null;
+  return ((v1 / v0) - 1) * 100;
+}
+
+function _bestWorstByPeriod(periods) {
+  // periods: [{days: 1, label: "当日"}, ...]
+  // 返回 { label_best, name_best, ret_best, label_worst, name_worst, ret_worst }
+  const sbi = INDUSTRY_DATA.series_by_industry || {};
+  const results = [];
+  const allInds = Object.keys(sbi).filter(k => !k.startsWith("_"));
+  periods.forEach(p => {
+    let best = { name: null, ret: -Infinity };
+    let worst = { name: null, ret: Infinity };
+    allInds.forEach(ind => {
+      const r = _industryNdayReturn(ind, p.days);
+      if (r == null) return;
+      if (r > best.ret) best = { name: ind, ret: r };
+      if (r < worst.ret) worst = { name: ind, ret: r };
+    });
+    if (best.name) results.push({
+      label: p.label + "最强",
+      name: best.name,
+      ret: best.ret,
+      color: "#dc2626",
+    });
+    if (worst.name) results.push({
+      label: p.label + "最弱",
+      name: worst.name,
+      ret: worst.ret,
+      color: "#16a34a",
+    });
+  });
+  return results;
+}
+
+function renderIndustryKPIs() {
+  if (!INDUSTRY_DATA || !INDUSTRY_DATA.latest || !INDUSTRY_DATA.latest.length) {
+    document.getElementById("industry-kpi-grid").innerHTML =
+      '<div class="kpi-card"><div class="kpi-label">行业指数数据为空</div></div>';
+    return;
+  }
+  const latest = INDUSTRY_DATA.latest;
+  const allMkt = latest.find(l => l.industry === "_全市场") || {};
+  const nonBank = latest.find(l => l.industry === "_非银行") || {};
+  const bw = _bestWorstByPeriod([{days: 1, label: "当日"}, {days: 5, label: "近5日"}, {days: 10, label: "近10日"}]);
+
+  // 前 2 个卡片：全市场 | 非银行（固定参考）
+  // 后 6 个卡片：当日最强/最弱 | 近5日最强/最弱 | 近10日最强/最弱
+  const refCards = [
+    { label: "全市场指数", data: allMkt, color: "#2563eb" },
+    { label: "非银行指数", data: nonBank, color: "#7c3aed" },
+  ];
+  let html = "";
+  refCards.forEach(c => {
+    const v = c.data.value != null ? c.data.value.toFixed(2) : "—";
+    const ret = c.data.ret != null ? c.data.ret.toFixed(2) : "—";
+    const retClass = c.data.ret > 0 ? "up" : (c.data.ret < 0 ? "down" : "flat");
+    const arrow = c.data.ret > 0 ? "▲" : (c.data.ret < 0 ? "▼" : "—");
+    html += `<div class="kpi-card" style="--kpi-color:${c.color}">
+      <div class="kpi-label">${c.label}</div>
+      <div class="kpi-value">${v}</div>
+      <div class="kpi-change ${retClass}">${arrow} ${ret}%<span style="font-weight:400;color:#94a3b8;margin-left:4px;">日涨跌</span></div>
+    </div>`;
+  });
+  bw.forEach(c => {
+    const retAbs = Math.abs(c.ret).toFixed(2);
+    const retClass = c.ret > 0 ? "up" : (c.ret < 0 ? "down" : "flat");
+    const arrow = c.ret > 0 ? "▲" : (c.ret < 0 ? "▼" : "—");
+    html += `<div class="kpi-card" style="--kpi-color:${c.color}">
+      <div class="kpi-label">${c.label}</div>
+      <div class="kpi-value" style="font-size:22px;">${c.name}</div>
+      <div class="kpi-change ${retClass}">${arrow} ${retAbs}%</div>
+    </div>`;
+  });
+  document.getElementById("industry-kpi-grid").innerHTML = html;
+}
+
+function renderIndustryChart() {
+  if (!INDUSTRY_DATA || !INDUSTRY_DATA.series_by_industry) return;
+  const sbi = INDUSTRY_DATA.series_by_industry;
+  const allInds = INDUSTRY_DATA.industries || Object.keys(sbi);
+  // 默认显示：汇总 + 前 5 大非特殊行业
+  const defaultShow = new Set();
+  ["_全市场", "_非银行"].forEach(k => { if (sbi[k]) defaultShow.add(k); });
+  allInds.filter(k => !k.startsWith("_")).slice(0, 5).forEach(k => defaultShow.add(k));
+
+  const datesAll = [];
+  const series = [];
+  allInds.forEach((ind, idx) => {
+    const pts = sbi[ind];
+    if (!pts || !pts.length) return;
+    const dates = pts.map(p => p.date);
+    const values = pts.map(p => p.value);
+    if (dates.length > datesAll.length) { datesAll.length = 0; datesAll.push(...dates); }
+    series.push({
+      name: ind,
+      type: "line",
+      data: values,
+      lineStyle: { color: IND_COLORS[idx % IND_COLORS.length], width: defaultShow.has(ind) ? 1.8 : 0.6 },
+      itemStyle: { color: IND_COLORS[idx % IND_COLORS.length] },
+      symbol: "none",
+      legendHoverLink: true,
+    });
+  });
+
+  // 确保 x 轴用最长的日期序列
+  const mainSeries = series.find(s => s.name === "_全市场");
+  const xDates = mainSeries && sbi["_全市场"] ? sbi["_全市场"].map(p => p.date) : datesAll;
+
+  const option = {
+    tooltip: {
+      trigger: "axis",
+      valueFormatter: v => v != null ? v.toFixed(2) : "—",
+    },
+    legend: {
+      type: "scroll", bottom: 0, textStyle: { fontSize: 11 },
+      selected: Object.fromEntries(allInds.map(ind => [ind, defaultShow.has(ind)])),
+    },
+    grid: { left: 55, right: 40, top: 16, bottom: 50 },
+    xAxis: {
+      type: "category", data: xDates, boundaryGap: false,
+      axisLabel: { formatter: v => v.slice(0, 7), fontSize: 10 },
+    },
+    yAxis: {
+      type: "value", name: "指数", scale: true,
+      splitLine: { lineStyle: { color: "#f1f5f9" } },
+    },
+    dataZoom: [
+      { type: "slider", bottom: 34, height: 16, textStyle: { fontSize: 9 } },
+      { type: "inside", zoomOnMouseWheel: true, moveOnMouseMove: true },
+    ],
+    series: series,
+  };
+  IND_CHART.setOption(option, true);
+}
+
+function renderIndustryTable() {
+  if (!INDUSTRY_DATA || !INDUSTRY_DATA.latest) return;
+  document.getElementById("ind-latest-date").textContent = INDUSTRY_DATA.latest_date || "";
+  const rows = INDUSTRY_DATA.latest;
+  let html = "";
+  rows.forEach(r => {
+    const retClass = r.ret > 0 ? "color:#dc2626;" : (r.ret < 0 ? "color:#16a34a;" : "color:#94a3b8;");
+    html += `<tr>
+      <td>${r.industry}</td>
+      <td>${r.value.toFixed(2)}</td>
+      <td style="${retClass}">${r.ret > 0 ? "+" : ""}${r.ret.toFixed(2)}%</td>
+      <td>${r.bonds}</td>
+    </tr>`;
+  });
+  document.getElementById("industry-table-body").innerHTML = html;
+}
+
+// ── 行业模块启动 ──
+renderIndustryKPIs();
+renderIndustryChart();
+renderIndustryTable();
+window.addEventListener("resize", () => { IND_CHART.resize(); });
 </script>
 </body>
 </html>"""
@@ -776,7 +1047,7 @@ def _get_echarts_js() -> str:
 
 
 # ── HTML 生成 ─────────────────────────────────────────────
-def build_html(all_data: dict, generated_at: str) -> str:
+def build_html(all_data: dict, industry_data: dict, generated_at: str) -> str:
     # 当前使用 CDN 加载 ECharts（稳定可靠）
     # 如需离线版本，可在有网时生成一次后，手动下载 echarts.min.js 放到 output/dashboard/ 目录
     inline = f'<script src="{_ECHARTS_CDN}"></script>'
@@ -790,6 +1061,8 @@ def build_html(all_data: dict, generated_at: str) -> str:
         "___GENERATED_AT___", generated_at
     ).replace(
         "___METRICS_JSON___", json.dumps(all_data, ensure_ascii=False, indent=2)
+    ).replace(
+        "___INDUSTRY_JSON___", json.dumps(industry_data, ensure_ascii=False)
     )
 
 
@@ -815,6 +1088,7 @@ def main(argv=None):
     conn = mysql_connect(args.host, args.port, args.user, args.password, args.database)
 
     all_data = {}
+    industry_data = {}
     try:
         for m in METRICS:
             print(f"  Loading: {m['name']} ... ", end="", flush=True)
@@ -825,6 +1099,16 @@ def main(argv=None):
                 print(f"{n} rows, latest={latest['date']} value={latest['value']}")
             else:
                 print("empty")
+
+        # 加载行业指数数据（跨库查询 cb_strategy）
+        print(f"  Loading: 行业指数 ... ", end="", flush=True)
+        try:
+            industry_data = load_industry_data(conn)
+            n_ind = len(industry_data.get("industries", []))
+            latest_d = industry_data.get("latest_date", "N/A")
+            print(f"{n_ind} 个行业, latest={latest_d}")
+        except Exception as e:
+            print(f"跳过 ({e})")
     finally:
         conn.close()
 
@@ -835,7 +1119,7 @@ def main(argv=None):
         return 1
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    html = build_html(all_data, generated_at)
+    html = build_html(all_data, industry_data, generated_at)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html, encoding="utf-8")

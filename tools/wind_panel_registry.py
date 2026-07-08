@@ -51,6 +51,34 @@ WSS_EXTRA_OPTIONS: Dict[str, str] = {
 # 每日同步/补洞时排除的转债（如上市取消），统一大写 Wind 代码
 EXCLUDED_BOND_CODES = frozenset({"123095.SZ"})
 
+# 截面基础信息 cb_bond_info：MySQL 列名 -> Wind w.wss 字段
+# 实测口径：w.wss(codes, fields, "tradeDate=YYYYMMDD;industryType=1")
+BOND_INFO_WSS_FIELDS: Dict[str, str] = {
+    "bond_name": "sec_name",
+    "list_date": "ipo_date",
+    "last_trade_date": "war_lasttradedate",
+    "stock_code": "underlyingcode",
+    "stock_name": "underlyingname",
+    "sw_industry_l1": "industry_sw_2021",
+}
+
+# w.wss option（tradeDate 由 sync 按最近交易日填入）
+BOND_INFO_WSS_OPTION_SUFFIX = "industryType=1"
+
+BOND_INFO_TEXT_COLUMNS = frozenset({"bond_name", "stock_code", "stock_name", "sw_industry_l1"})
+BOND_INFO_DATE_COLUMNS = frozenset({"list_date", "last_trade_date"})
+
+# 转债基础信息.xlsx 表头 -> cb_bond_info 列名
+BOND_INFO_EXCEL_COLUMNS: Dict[str, str] = {
+    "证券代码": "bond_code",
+    "证券简称": "bond_name",
+    "上市日期": "list_date",
+    "最后交易日": "last_trade_date",
+    "正股代码": "stock_code",
+    "正股简称": "stock_name",
+    "申万一级行业": "sw_industry_l1",
+}
+
 
 def numeric_panel_tables() -> Dict[str, str]:
     return {**CORE_NUMERIC_PANEL_TABLES, **EXTRA_NUMERIC_PANEL_TABLES}
@@ -96,6 +124,18 @@ def is_excluded_bond_code(code: object) -> bool:
         return False
     s = str(code).strip().upper()
     return bool(s) and s in EXCLUDED_BOND_CODES
+
+
+def bond_info_wss_field_list() -> str:
+    """cb_bond_info 需拉取的 Wind 字段（逗号分隔、去重保序）。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for wf in BOND_INFO_WSS_FIELDS.values():
+        key = wf.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(wf)
+    return ",".join(out)
 
 
 def filter_excluded_bond_codes(codes: Sequence[str]) -> list[str]:
